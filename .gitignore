@@ -1,0 +1,15 @@
+# GoLand (JetBrains) системные файлы
+.idea/
+
+# Скомпилированные бинарники Go
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+eth-indexer
+
+# Локальные переменные окружения (секреты)
+.env
