@@ -2,40 +2,34 @@ package main
 
 import (
 	"log"
-	"time"
 
+	"github.com/gorgohub/eth-indexer/internal/config"
 	"github.com/gorgohub/eth-indexer/internal/storage"
 )
 
 func main() {
-	log.Println("Starting Indexer Test DB Write...")
+	log.Println("Starting Web3 Indexer service...")
 
-	dsn := "postgres://indexer_user:indexer_password@localhost:5432/eth_indexer?sslmode=disable"
-
-	// Initialize database connection
-	db, err := storage.NewConnect(dsn)
+	// Step 1: Load application configuration
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Initialization failed: %v", err)
+		log.Fatalf("Config initialization failed: %v", err)
 	}
+	log.Println("Configuration successfully loaded.")
+
+	// Step 2: Initialize database connection pool using loaded config
+	db, err := storage.NewConnect(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("Database initialization failed: %v", err)
+	}
+
+	// Professional defer block: log error if connection pool fails to close cleanly
 	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("Warning: failed to close database connection cleanly: %v", err)
+		if closeErr := db.Close(); closeErr != nil {
+			log.Printf("Warning: failed to close database connection pool: %v", closeErr)
 		}
 	}()
 
-	// Create fake/mock Ethereum block data for testing
-	testBlock := storage.Block{
-		BlockNumber:    18000000,
-		BlockHash:      "0x61a8db8615bee4356cf9e31d471b402ebcf0ef0a9c68cf5b2c79f1df7ef95a86",
-		ParentHash:     "0x411ed0398f623b08fa1160a2b535ff206a4b3d7cfdf331166418cf0377ee7144",
-		BlockTimestamp: time.Now().UTC(),
-	}
-
-	// Try to execute the database insert
-	err = db.SaveBlock(testBlock)
-	if err != nil {
-		log.Fatalf("Failed to save block to DB: %v", err)
-	}
-
-	log.Println("Success! Test block 18000000 was successfully written to PostgreSQL.")
+	log.Println("Database connection pool established from configuration parameters.")
+	log.Printf("Ready to index Ethereum blockchain node at: %s", cfg.EthRPCURL)
 }
