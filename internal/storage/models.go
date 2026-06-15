@@ -1,25 +1,21 @@
 package storage
 
-import (
-	"time"
-)
-
-// Block represents the 'blocks' table row structure
+// Block represents the normalized Ethereum block header for PostgreSQL
 type Block struct {
-	BlockNumber    int64
-	BlockHash      string
-	ParentHash     string
-	BlockTimestamp time.Time
+	BlockNumber    int64  `db:"block_number"`
+	BlockHash      string `db:"block_hash"`
+	ParentHash     string `db:"parent_hash"`
+	BlockTimestamp int64  `db:"block_timestamp"` // Добавили поле времени
 }
 
-// Transaction represents the 'transactions' table row structure
+// Transaction represents the normalized Ethereum transaction schema for PostgreSQL
 type Transaction struct {
-	TxHash      string
-	BlockNumber int64
-	FromAddress string
-	ToAddress   *string // Using pointer because ToAddress can be NULL for contract deployment
-	Value       string  // Stored as string to safely pass big numeric value to PostgreSQL NUMERIC
-	GasPrice    int64
-	GasLimit    int64
-	Nonce       int64
+	TxHash      string  `db:"tx_hash"`
+	BlockNumber int64   `db:"block_number"`
+	FromAddress string  `db:"from_address"`
+	ToAddress   *string `db:"to_address"` // Can be nil if it's a contract creation tx
+	Value       string  `db:"value"`      // Stored as string to safely handle uint256 Wei
+	GasPrice    int64   `db:"gas_price"`
+	GasLimit    int64   `db:"gas_limit"`
+	Nonce       int64   `db:"nonce"`
 }

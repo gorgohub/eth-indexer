@@ -35,19 +35,17 @@ func NewConnect(dsn string) (*DB, error) {
 	return &DB{db}, nil
 }
 
-// SaveBlock inserts a single block metadata into the database
-func (db *DB) SaveBlock(block Block) error {
+// SaveBlock inserts a single block header record into the database
+func (db *DB) SaveBlock(number int64, hash string, parentHash string, timestamp int64) error {
 	query := `
 		INSERT INTO blocks (block_number, block_hash, parent_hash, block_timestamp)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (block_number) DO NOTHING;
 	`
-
-	_, err := db.Exec(query, block.BlockNumber, block.BlockHash, block.ParentHash, block.BlockTimestamp)
+	_, err := db.Exec(query, number, hash, parentHash, timestamp)
 	if err != nil {
-		return fmt.Errorf("failed to insert block %d: %w", block.BlockNumber, err)
+		return fmt.Errorf("failed to save block headers: %w", err)
 	}
-
 	return nil
 }
 

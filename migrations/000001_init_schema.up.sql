@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     block_number BIGINT PRIMARY KEY,
     block_hash VARCHAR(66) NOT NULL UNIQUE,
     parent_hash VARCHAR(66) NOT NULL,
-    block_timestamp TIMESTAMP NOT NULL
+    block_timestamp BIGINT NOT NULL
     );
 
 -- Table for storing Ethereum transactions
