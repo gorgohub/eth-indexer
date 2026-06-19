@@ -78,23 +78,18 @@ func (s *Syncer) Start(ctx context.Context) error {
 		// Set a strict timeout per individual block extraction to prevent network hanging
 		blockCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 
-		txs, err := s.client.GetBlockTransactions(blockCtx, currentBlock)
-		cancel() // Call cancel immediately after operation to clear context resources
+		// Принимаем реальные транзакции и данные заголовка блока
+		txs, headerData, err := s.client.GetBlockTransactions(blockCtx, currentBlock)
+		cancel()
 		if err != nil {
-			log.Printf("ETL Error: failed to extract transactions for block %d: %v. Retrying...", currentBlock, err)
+			log.Printf("ETL Error: failed to extract data for block %d: %v. Retrying...", currentBlock, err)
 			time.Sleep(3 * time.Second)
 			continue
 		}
 
-		// In a real loop, we would fetch block headers (hash, parent_hash, time) dynamically.
-		// For this pipeline stage, we generate structured dummy data to pass database constraints.
-		// Next step will integrate dynamic headers.
-		// Исправлено: используем fmt.Sprintf для корректного перевода чисел в уникальные строки
-		dummyHash := fmt.Sprintf("0x%d_hash_placeholder", currentBlock)
-		dummyParent := fmt.Sprintf("0x%d_parent_placeholder", currentBlock-1)
-		mockTime := time.Now().Unix()
-
-		err = s.db.SaveBlock(int64(currentBlock), dummyHash, dummyParent, mockTime)
+		// Заглушки dummyHash, dummyParent и mockTime БОЛЬШЕ НЕ НУЖНЫ.
+		// Передаем в базу настоящие данные из блокчейна:
+		err = s.db.SaveBlock(int64(currentBlock), headerData.Hash, headerData.ParentHash, headerData.Time)
 		if err != nil {
 			log.Printf("Database Error: failed to write block header %d: %v. Retrying...", currentBlock, err)
 			time.Sleep(3 * time.Second)

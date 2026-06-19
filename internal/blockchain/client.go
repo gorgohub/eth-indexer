@@ -15,6 +15,13 @@ type Client struct {
 	rpcClient *ethclient.Client
 }
 
+// BlockHeaderData holds normalized block metadata needed for DB insertion
+type BlockHeaderData struct {
+	Hash       string
+	ParentHash string
+	Time       int64
+}
+
 // NewClient initializes a new connection to the Ethereum RPC node
 func NewClient(rawURL string) (*Client, error) {
 	// Connect to the Ethereum node via JSON-RPC
@@ -55,57 +62,56 @@ func (c *Client) GetBlockNumberByHash(ctx context.Context, hashStr string) (*big
 	return nil, nil
 }
 
-// GetBlockTransactions fetches a full block by its number and normalizes its transactions for our database
-func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) ([]storage.Transaction, error) {
-	// Convert uint64 block number to big.Int required by go-ethereum SDK
+// GetBlockTransactions fetches a full block by its number, normalizes its metadata and its transactions
+func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) ([]storage.Transaction, BlockHeaderData, error) {
 	bigNumber := new(big.Int).SetUint64(blockNumber)
 
-	// Fetch full block data from the RPC node
 	rawBlock, err := c.rpcClient.BlockByNumber(ctx, bigNumber)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch block %d from node: %w", blockNumber, err)
+		return nil, BlockHeaderData{}, fmt.Errorf("failed to fetch block %d from node: %w", blockNumber, err)
 	}
 	if rawBlock == nil {
-		return nil, fmt.Errorf("received empty block pointer for height %d", blockNumber)
+		return nil, BlockHeaderData{}, fmt.Errorf("received empty block pointer for height %d", blockNumber)
 	}
 
-	// Fetch the ChainID needed to correctly decode the transaction sender ("From" address)
+	// Извлекаем реальные метаданные блока
+	headerData := BlockHeaderData{
+		Hash:       rawBlock.Hash().Hex(),
+		ParentHash: rawBlock.ParentHash().Hex(),
+		Time:       int64(rawBlock.Time()),
+	}
+
 	chainID, err := c.rpcClient.ChainID(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch chain ID: %w", err)
+		return nil, BlockHeaderData{}, fmt.Errorf("failed to fetch chain ID: %w", err)
 	}
 	signer := types.LatestSignerForChainID(chainID)
 
 	rawTxs := rawBlock.Transactions()
 	normalizedTxs := make([]storage.Transaction, 0, len(rawTxs))
 
-	// Loop through all raw transactions and transform them into our storage schema
 	for _, tx := range rawTxs {
 		if tx == nil {
 			continue
 		}
 
-		// Extract the sender address ("From"). This requires cryptographic signer decoding.
 		fromAddr, err := types.Sender(signer, tx)
 		if err != nil {
-			// If decoding fails for a single tx, log it and skip to prevent stopping the entire sync
 			continue
 		}
 
-		// Extract the recipient address ("To"). It can be nil if the transaction creates a smart contract.
 		var toAddrStr *string
 		if tx.To() != nil {
 			str := tx.To().Hex()
 			toAddrStr = &str
 		}
 
-		// Safely convert types to match our database types (uint64 to int64, big.Int to string)
 		normalizedTx := storage.Transaction{
 			TxHash:      tx.Hash().Hex(),
 			BlockNumber: int64(blockNumber),
 			FromAddress: fromAddr.Hex(),
 			ToAddress:   toAddrStr,
-			Value:       tx.Value().String(), // uint256 converted to exact string representation
+			Value:       tx.Value().String(),
 			GasPrice:    tx.GasPrice().Int64(),
 			GasLimit:    int64(tx.Gas()),
 			Nonce:       int64(tx.Nonce()),
@@ -114,5 +120,6 @@ func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) (
 		normalizedTxs = append(normalizedTxs, normalizedTx)
 	}
 
-	return normalizedTxs, nil
+	// Возвращаем и транзакции, и реальный заголовок
+	return normalizedTxs, headerData, nil
 }
