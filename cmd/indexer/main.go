@@ -3,23 +3,23 @@ package main
 import (
 	"context"
 	"log"
-	"time"
 
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
 	"github.com/gorgohub/eth-indexer/internal/config"
 	"github.com/gorgohub/eth-indexer/internal/storage"
+	"github.com/gorgohub/eth-indexer/internal/sync"
 )
 
 func main() {
 	log.Println("Starting Web3 Indexer service...")
 
-	// Step 1: Load configuration
+	// Step 1: Load environment variables
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Config initialization failed: %v", err)
 	}
 
-	// Step 2: Connect to Database
+	// Step 2: Establish connection pool with PostgreSQL
 	db, err := storage.NewConnect(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Database initialization failed: %v", err)
@@ -30,41 +30,21 @@ func main() {
 		}
 	}()
 
-	// Step 3: Connect to Ethereum
+	// Step 3: Initialize network Ethereum RPC client
 	ethClient, err := blockchain.NewClient(cfg.EthRPCURL)
 	if err != nil {
 		log.Fatalf("Blockchain client initialization failed: %v", err)
 	}
 	defer ethClient.Close()
 
-	// Step 4: Run ETL Process for a specific historical block
-	// Let's take a block close to the current height, for example, 25321800
-	targetBlock := uint64(25321800)
-	log.Printf("Starting ETL pipeline for Ethereum block #%d...", targetBlock)
+	// Step 4: Setup and run the background background synchronization loop
+	syncer := sync.NewSyncer(db, ethClient)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	// Create a long-lived base context for the indexer worker daemon
+	ctx := context.Background()
 
-	// E & T: Extract and Transform transactions from blockchain
-	txs, err := ethClient.GetBlockTransactions(ctx, targetBlock)
-	if err != nil {
-		log.Fatalf("ETL Extract failed: %v", err)
+	log.Println("ETL Worker engine successfully armed. Entering infinite processing loop...")
+	if err := syncer.Start(ctx); err != nil {
+		log.Fatalf("Critical sync loop failure: %v", err)
 	}
-	log.Printf("Extracted and normalized %d transactions from block #%d.", len(txs), targetBlock)
-
-	// Исправлено: передаем 4 параметра, включая текущий Unix-timestamp (время)
-	currentTimestamp := time.Now().Unix()
-	err = db.SaveBlock(int64(targetBlock), "test_hash_25321800", "test_parent_hash", currentTimestamp)
-	if err != nil {
-		log.Fatalf("ETL Load failed: could not save block header: %v", err)
-	}
-	log.Printf("Block header #%d successfully registered in database.", targetBlock)
-
-	// L: Load transactions into PostgreSQL within a single secure database transaction
-	err = db.SaveTransactions(txs)
-	if err != nil {
-		log.Fatalf("ETL Load failed: could not save transactions to DB: %v", err)
-	}
-
-	log.Printf("🚀 ETL SUCCESS! %d transactions are now permanently indexed in PostgreSQL.", len(txs))
 }

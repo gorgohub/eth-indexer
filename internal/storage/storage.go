@@ -1,38 +1,65 @@
 package storage
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // PostgreSQL driver
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DB represents the database connection pool
+// DB wraps the modern pgx connection pool
 type DB struct {
-	*sql.DB
+	pool *pgxpool.Pool
 }
 
-// NewConnect establishes a new connection pool to the PostgreSQL database
+// NewConnect initializes a high-performance concurrent connection pool to PostgreSQL
 func NewConnect(dsn string) (*DB, error) {
-	// Open connection using pgx driver
-	db, err := sql.Open("pgx", dsn)
+	// Parse configurations from the DSN string
+	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("unable to parse DSN string: %w", err)
 	}
 
-	// Configure connection pool settings optimized for high-throughput ETL
-	db.SetMaxOpenConns(25)                 // Limit maximum active connections
-	db.SetMaxIdleConns(25)                 // Keep idle connections alive for reuse
-	db.SetConnMaxLifetime(5 * time.Minute) // Recycle connections to prevent memory leaks
+	// Optimize connection parameters for an infrastructure ETL pipeline
+	config.MaxConns = 20
+	config.MinConns = 5
+	config.MaxConnIdleTime = 30 * time.Minute
 
-	// Verify the connection is alive
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
+	// Establish the connection pool
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection pool: %w", err)
+	}
+
+	// Immediate validation ping
+	if err := pool.Ping(context.Background()); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	return &DB{db}, nil
+	return &DB{pool: pool}, nil
+}
+
+// Close cleanly shuts down all active network connections in the pool
+func (db *DB) Close() error {
+	db.pool.Close()
+	return nil
+}
+
+// GetLatestSavedBlock returns the highest block number present in the database.
+// Uses pgx native signatures where context is mandatory.
+func (db *DB) GetLatestSavedBlock() (int64, error) {
+	query := `SELECT COALESCE(MAX(block_number), 0) FROM blocks;`
+
+	var lastBlock int64
+	// pgx.QueryRow strictly demands context as the first argument
+	err := db.pool.QueryRow(context.Background(), query).Scan(&lastBlock)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch max block number: %w", err)
+	}
+
+	return lastBlock, nil
 }
 
 // SaveBlock inserts a single block header record into the database
@@ -42,29 +69,27 @@ func (db *DB) SaveBlock(number int64, hash string, parentHash string, timestamp 
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (block_number) DO NOTHING;
 	`
-	_, err := db.Exec(query, number, hash, parentHash, timestamp)
+	_, err := db.pool.Exec(context.Background(), query, number, hash, parentHash, timestamp)
 	if err != nil {
 		return fmt.Errorf("failed to save block headers: %w", err)
 	}
 	return nil
 }
 
-// SaveTransactions inserts multiple transactions efficiently using a single database transaction
+// SaveTransactions inserts multiple transactions inside a single strict database transaction
 func (db *DB) SaveTransactions(txs []Transaction) error {
 	if len(txs) == 0 {
 		return nil
 	}
 
-	// Begin a standard database transaction
-	txCtx, err := db.Begin()
+	// Begin a native pgx transaction
+	txCtx, err := db.pool.Begin(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to begin database transaction: %w", err)
 	}
 
-	// Explicitly ignore Rollback error in defer, because Rollback will naturally
-	// fail with an error if txCtx.Commit() succeeds below. This is expected behavior.
 	defer func() {
-		_ = txCtx.Rollback()
+		_ = txCtx.Rollback(context.Background())
 	}()
 
 	query := `
@@ -73,27 +98,18 @@ func (db *DB) SaveTransactions(txs []Transaction) error {
 		ON CONFLICT (tx_hash) DO NOTHING;
 	`
 
-	// Prepare the statement inside the transaction for maximum reuse speed
-	stmt, err := txCtx.Prepare(query)
-	if err != nil {
-		return fmt.Errorf("failed to prepare statement: %w", err)
-	}
-
-	// Explicitly ignore Close error since we cannot do anything useful if closing a statement fails here
-	defer func() {
-		_ = stmt.Close()
-	}()
-
-	// Execute inserts in a clean loop, but inside the same isolated transaction
+	// In pgx, raw batch queries or copy protocol are preferred, but to keep our logic
+	// compliant with previous steps we iterate within the transaction context.
 	for _, tx := range txs {
-		_, err = stmt.Exec(tx.TxHash, tx.BlockNumber, tx.FromAddress, tx.ToAddress, tx.Value, tx.GasPrice, tx.GasLimit, tx.Nonce)
+		_, err = txCtx.Exec(context.Background(), query,
+			tx.TxHash, tx.BlockNumber, tx.FromAddress, tx.ToAddress, tx.Value, tx.GasPrice, tx.GasLimit, tx.Nonce,
+		)
 		if err != nil {
-			return fmt.Errorf("failed to execute prepared statement for tx %s: %w", tx.TxHash, err)
+			return fmt.Errorf("failed to execute tx insert %s: %w", tx.TxHash, err)
 		}
 	}
 
-	// Commit all changes to disk at once
-	if err := txCtx.Commit(); err != nil {
+	if err := txCtx.Commit(context.Background()); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
