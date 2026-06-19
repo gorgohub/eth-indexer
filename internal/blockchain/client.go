@@ -63,7 +63,7 @@ func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) (
 	// Fetch full block data from the RPC node
 	rawBlock, err := c.rpcClient.BlockByNumber(ctx, bigNumber)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch block %d from node: %w", err)
+		return nil, fmt.Errorf("failed to fetch block %d from node: %w", blockNumber, err)
 	}
 	if rawBlock == nil {
 		return nil, fmt.Errorf("received empty block pointer for height %d", blockNumber)
