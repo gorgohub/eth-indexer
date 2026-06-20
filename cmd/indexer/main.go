@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
 	"github.com/gorgohub/eth-indexer/internal/config"
@@ -13,38 +17,47 @@ import (
 func main() {
 	log.Println("Starting Web3 Indexer service...")
 
-	// Step 1: Load environment variables
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Config initialization failed: %v", err)
 	}
 
-	// Step 2: Establish connection pool with PostgreSQL
 	db, err := storage.NewConnect(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Database initialization failed: %v", err)
 	}
-	defer func() {
-		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close database connection pool: %v", closeErr)
-		}
-	}()
 
-	// Step 3: Initialize network Ethereum RPC client
 	ethClient, err := blockchain.NewClient(cfg.EthRPCURL)
 	if err != nil {
 		log.Fatalf("Blockchain client initialization failed: %v", err)
 	}
-	defer ethClient.Close()
 
-	// Step 4: Setup and run the background background synchronization loop
+	// НАЧАЛО БЛОКА GRACEFUL SHUTDOWN
+	// Создаем контекст, который автоматически перейдет в статус Done при нажатии Ctrl+C (SIGINT) или остановке (SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	syncer := sync.NewSyncer(db, ethClient)
 
-	// Create a long-lived base context for the indexer worker daemon
-	ctx := context.Background()
-
 	log.Println("ETL Worker engine successfully armed. Entering infinite processing loop...")
+
+	// Передаем наш контролируемый контекст в синхронизатор
 	if err := syncer.Start(ctx); err != nil {
-		log.Fatalf("Critical sync loop failure: %v", err)
+		// Обычная отмена контекста по сигналу — это не авария, а штатный выход
+		if errors.Is(err, context.Canceled) {
+			log.Println("Indexer service stopped cleanly via graceful shutdown.")
+		} else {
+			log.Printf("Critical sync loop failure: %v", err)
+		}
 	}
+
+	// Мягко закрываем ресурсы после остановки цикла
+	log.Println("Closing underlying network connections and DB pools...")
+	ethClient.Close()
+
+	if err := db.Close(); err != nil {
+		log.Printf("Failed to cleanly close database connection pool: %v", err)
+	}
+
+	log.Println("Shutdown complete. Bye!")
 }
