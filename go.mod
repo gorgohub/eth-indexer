@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ethereum/go-ethereum v1.17.3
+	github.com/go-chi/chi/v5 v5.3.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/joho/godotenv v1.5.1
 )

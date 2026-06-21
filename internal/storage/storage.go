@@ -115,3 +115,58 @@ func (db *DB) SaveTransactions(txs []Transaction) error {
 
 	return nil
 }
+
+// GetBlockByNumber fetches metadata for a specific block from the database.
+func (db *DB) GetBlockByNumber(ctx context.Context, number int64) (*Block, error) {
+	query := `
+		SELECT block_number, block_hash, parent_hash, block_timestamp 
+		FROM blocks 
+		WHERE block_number = $1;
+	`
+
+	var b Block
+	err := db.pool.QueryRow(ctx, query, number).Scan(
+		&b.BlockNumber, &b.BlockHash, &b.ParentHash, &b.BlockTimestamp,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch block %d: %w", number, err)
+	}
+
+	return &b, nil
+}
+
+// GetTransactionsByAddress fetches last 100 transactions related to an address (from or to).
+func (db *DB) GetTransactionsByAddress(ctx context.Context, address string) ([]Transaction, error) {
+	query := `
+		SELECT tx_hash, block_number, from_address, to_address, value, gas_price, gas_limit, nonce
+		FROM transactions
+		WHERE from_address = $1 OR to_address = $1
+		ORDER BY block_number DESC
+		LIMIT 100;
+	`
+
+	rows, err := db.pool.Query(ctx, query, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query transactions for address %s: %w", address, err)
+	}
+	defer rows.Close()
+
+	var txs []Transaction
+	for rows.Next() {
+		var tx Transaction
+		err = rows.Scan(
+			&tx.TxHash, &tx.BlockNumber, &tx.FromAddress, &tx.ToAddress,
+			&tx.Value, &tx.GasPrice, &tx.GasLimit, &tx.Nonce,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan transaction row: %w", err)
+		}
+		txs = append(txs, tx)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return txs, nil
+}
