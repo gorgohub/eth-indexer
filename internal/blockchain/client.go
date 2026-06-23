@@ -90,6 +90,8 @@ func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) (
 	rawTxs := rawBlock.Transactions()
 	normalizedTxs := make([]storage.Transaction, 0, len(rawTxs))
 
+	// ... (начало метода GetBlockTransactions остается прежним)
+
 	for _, tx := range rawTxs {
 		if tx == nil {
 			continue
@@ -115,6 +117,36 @@ func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) (
 			GasPrice:    tx.GasPrice().Int64(),
 			GasLimit:    int64(tx.Gas()),
 			Nonce:       int64(tx.Nonce()),
+			TokenMoves:  []storage.TokenTransfer{}, // Initialize empty slice
+		}
+
+		// ERC-20 Parsing Logic via Raw Input Inspection
+		// The standard ERC-20 transfer method signature hash is 0xa9059cbb
+		txData := tx.Data()
+		if len(txData) >= 68 && txData[0] == 0xa9 && txData[1] == 0x05 && txData[2] == 0x9c && txData[3] == 0xbb {
+			if tx.To() != nil {
+				// The recipient of the TX is the token smart contract address
+				contractAddr := tx.To().Hex()
+
+				// Extract recipient address (next 32 bytes, offset by 4 byte selector, Ethereum address uses last 20 bytes)
+				toByteOffset := 4 + 12
+				parsedToAddr := fmt.Sprintf("0x%x", txData[toByteOffset:4+32])
+
+				// Extract value payload (next 32 bytes)
+				valueBytes := txData[4+32 : 4+64]
+				parsedValue := new(big.Int).SetBytes(valueBytes).String()
+
+				tokenMove := storage.TokenTransfer{
+					TxHash:          normalizedTx.TxHash,
+					BlockNumber:     normalizedTx.BlockNumber,
+					ContractAddress: contractAddr,
+					FromAddress:     normalizedTx.FromAddress,
+					ToAddress:       parsedToAddr,
+					Value:           parsedValue,
+				}
+
+				normalizedTx.TokenMoves = append(normalizedTx.TokenMoves, tokenMove)
+			}
 		}
 
 		normalizedTxs = append(normalizedTxs, normalizedTx)

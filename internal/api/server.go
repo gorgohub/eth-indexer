@@ -48,6 +48,7 @@ func (s *Server) routes() {
 	s.router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/block/{number}", s.handleGetBlock)
 		r.Get("/address/{address}/transactions", s.handleGetTransactions)
+		r.Get("/address/{address}/tokens", s.handleGetTokenTransfers)
 	})
 }
 
@@ -83,18 +84,36 @@ func (s *Server) handleGetTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	txs, err := s.db.GetTransactionsByAddress(r.Context(), address)
-	if err != nil {
-		log.Printf("API error: %v", err)
+	s.respondWithSlice(w, txs, err)
+}
+
+// handleGetTokenTransfers fetches ERC-20 transfers for an account: GET /api/v1/address/{address}/tokens
+func (s *Server) handleGetTokenTransfers(w http.ResponseWriter, r *http.Request) {
+	address := chi.URLParam(r, "address")
+	if address == "" {
+		s.respondWithError(w, http.StatusBadRequest, "Missing address parameter")
+		return
+	}
+
+	transfers, err := s.db.GetTokenTransfersByAddress(r.Context(), address)
+	s.respondWithSlice(w, transfers, err)
+}
+
+// respondWithSlice helper processes query errors and forces empty json array instead of null
+func (s *Server) respondWithSlice(w http.ResponseWriter, data interface{}, queryErr error) {
+	if queryErr != nil {
+		log.Printf("API error: %v", queryErr)
 		s.respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
-	// Ensure we return an empty array instead of null if no transactions found
-	if txs == nil {
-		txs = []storage.Transaction{}
+	// If the specific slice pointer is nil, output an empty json array structure
+	if data == nil {
+		s.respondWithJSON(w, http.StatusOK, []string{})
+		return
 	}
 
-	s.respondWithJSON(w, http.StatusOK, txs)
+	s.respondWithJSON(w, http.StatusOK, data)
 }
 
 // respondWithJSON helper writes a standardized JSON response

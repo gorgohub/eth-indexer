@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -76,13 +77,12 @@ func (db *DB) SaveBlock(number int64, hash string, parentHash string, timestamp 
 	return nil
 }
 
-// SaveTransactions inserts multiple transactions inside a single strict database transaction
+// SaveTransactions inserts multiple transactions and their internal token transfers inside a strict database transaction.
 func (db *DB) SaveTransactions(txs []Transaction) error {
 	if len(txs) == 0 {
 		return nil
 	}
 
-	// Begin a native pgx transaction
 	txCtx, err := db.pool.Begin(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to begin database transaction: %w", err)
@@ -92,25 +92,41 @@ func (db *DB) SaveTransactions(txs []Transaction) error {
 		_ = txCtx.Rollback(context.Background())
 	}()
 
-	query := `
+	txQuery := `
 		INSERT INTO transactions (tx_hash, block_number, from_address, to_address, value, gas_price, gas_limit, nonce)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (tx_hash) DO NOTHING;
 	`
 
-	// In pgx, raw batch queries or copy protocol are preferred, but to keep our logic
-	// compliant with previous steps we iterate within the transaction context.
-	for _, tx := range txs {
-		_, err = txCtx.Exec(context.Background(), query,
-			tx.TxHash, tx.BlockNumber, tx.FromAddress, tx.ToAddress, tx.Value, tx.GasPrice, tx.GasLimit, tx.Nonce,
+	tokenQuery := `
+		INSERT INTO token_transfers (tx_hash, block_number, contract_address, from_address, to_address, value)
+		VALUES ($1, $2, $3, $4, $5, $6);
+	`
+
+	for _, item := range txs {
+		_, err = txCtx.Exec(context.Background(), txQuery,
+			item.TxHash, item.BlockNumber, item.FromAddress, item.ToAddress, item.Value, item.GasPrice, item.GasLimit, item.Nonce,
 		)
 		if err != nil {
-			return fmt.Errorf("failed to execute tx insert %s: %w", tx.TxHash, err)
+			return fmt.Errorf("failed to execute transaction query: %w", err)
+		}
+
+		for _, tokenMove := range item.TokenMoves {
+			_, err = txCtx.Exec(context.Background(), tokenQuery,
+				tokenMove.TxHash, tokenMove.BlockNumber, tokenMove.ContractAddress,
+				tokenMove.FromAddress, tokenMove.ToAddress, tokenMove.Value,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to execute token transfer query: %w", err)
+			}
+
+			// Вот эта строчка покажет вам результат прямо в консоли при работе!
+			log.Printf("[ERC-20] Found token transfer: %s tokens from %s to %s", tokenMove.Value, tokenMove.FromAddress, tokenMove.ToAddress)
 		}
 	}
 
-	if err := txCtx.Commit(context.Background()); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	if err = txCtx.Commit(context.Background()); err != nil {
+		return fmt.Errorf("failed to commit database transaction: %w", err)
 	}
 
 	return nil
@@ -169,4 +185,37 @@ func (db *DB) GetTransactionsByAddress(ctx context.Context, address string) ([]T
 	}
 
 	return txs, nil
+}
+
+// GetTokenTransfersByAddress fetches the last 100 ERC-20 token transfers for a specific address.
+func (db *DB) GetTokenTransfersByAddress(ctx context.Context, address string) ([]TokenTransfer, error) {
+	query := `
+		SELECT tx_hash, block_number, contract_address, from_address, to_address, value::TEXT
+		FROM token_transfers
+		WHERE from_address = $1 OR to_address = $1
+		ORDER BY block_number DESC
+		LIMIT 100;
+	`
+
+	rows, err := db.pool.Query(ctx, query, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query token transfers for address %s: %w", address, err)
+	}
+	defer rows.Close()
+
+	var transfers []TokenTransfer
+	for rows.Next() {
+		var t TokenTransfer
+		err = rows.Scan(&t.TxHash, &t.BlockNumber, &t.ContractAddress, &t.FromAddress, &t.ToAddress, &t.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan token transfer row: %w", err)
+		}
+		transfers = append(transfers, t)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("token transfers rows iteration error: %w", err)
+	}
+
+	return transfers, nil
 }
