@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
+	"github.com/gorgohub/eth-indexer/internal/notifier"
 	"github.com/gorgohub/eth-indexer/internal/storage"
 )
 
@@ -19,16 +20,19 @@ type blockResult struct {
 }
 
 // Syncer orchestrates the ETL pipeline loop between Ethereum and PostgreSQL
+// Добавьте импорт "github.com/gorgohub/eth-indexer/internal/notifier" в блок import
 type Syncer struct {
-	db     *storage.DB
-	client *blockchain.Client
+	db       *storage.DB
+	client   *blockchain.Client
+	notifier *notifier.Notifier // Added notifier dependency
 }
 
 // NewSyncer creates a new synchronizer instance
 func NewSyncer(db *storage.DB, client *blockchain.Client) *Syncer {
 	return &Syncer{
-		db:     db,
-		client: client,
+		db:       db,
+		client:   client,
+		notifier: notifier.NewNotifier(), // Initialize notifier service
 	}
 }
 
@@ -141,6 +145,9 @@ func (s *Syncer) Start(ctx context.Context) error {
 				hasErrors = true
 				continue
 			}
+
+			// Trigger the real-time notification layer for parsed token transfers
+			s.notifier.CheckAndNotify(res.txs[i].TokenMoves)
 
 			log.Printf("Successfully indexed block #%d (%d transactions committed).", res.blockNumber, len(res.txs))
 		}
