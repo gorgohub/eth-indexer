@@ -104,8 +104,7 @@ func (c *Client) GetBlockTransactions(ctx context.Context, blockNumber uint64) (
 
 		var toAddrStr *string
 		if tx.To() != nil {
-			str := tx.To().Hex()
-			toAddrStr = &str
+			toAddrStr = new(tx.To().Hex())
 		}
 
 		normalizedTx := storage.Transaction{
