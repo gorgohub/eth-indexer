@@ -3,9 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -77,7 +77,7 @@ func (db *DB) SaveBlock(number int64, hash string, parentHash string, timestamp 
 	return nil
 }
 
-// SaveTransactions inserts multiple transactions and their internal token transfers inside a strict database transaction.
+// SaveTransactions inserts multiple transactions and their internal token transfers using high-performance bulk COPY protocol.
 func (db *DB) SaveTransactions(txs []Transaction) error {
 	if len(txs) == 0 {
 		return nil
@@ -87,41 +87,54 @@ func (db *DB) SaveTransactions(txs []Transaction) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin database transaction: %w", err)
 	}
-
 	defer func() {
 		_ = txCtx.Rollback(context.Background())
 	}()
 
-	txQuery := `
-		INSERT INTO transactions (tx_hash, block_number, from_address, to_address, value, gas_price, gas_limit, nonce)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (tx_hash) DO NOTHING;
-	`
+	// 1. Bulk insert main transactions
+	txColumns := []string{"tx_hash", "block_number", "from_address", "to_address", "value", "gas_price", "gas_limit", "nonce"}
+	txRows := make([][]any, 0, len(txs))
 
-	tokenQuery := `
-		INSERT INTO token_transfers (tx_hash, block_number, contract_address, from_address, to_address, value)
-		VALUES ($1, $2, $3, $4, $5, $6);
-	`
-
+	var tokenTransfersCount int
 	for _, item := range txs {
-		_, err = txCtx.Exec(context.Background(), txQuery,
+		txRows = append(txRows, []any{
 			item.TxHash, item.BlockNumber, item.FromAddress, item.ToAddress, item.Value, item.GasPrice, item.GasLimit, item.Nonce,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to execute transaction query: %w", err)
+		})
+		tokenTransfersCount += len(item.TokenMoves)
+	}
+
+	_, err = txCtx.CopyFrom(
+		context.Background(),
+		pgx.Identifier{"transactions"},
+		txColumns,
+		pgx.CopyFromRows(txRows),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to bulk copy transactions: %w", err)
+	}
+
+	// 2. Bulk insert ERC-20 token transfers if any exist in the batch
+	if tokenTransfersCount > 0 {
+		tokenColumns := []string{"tx_hash", "block_number", "contract_address", "from_address", "to_address", "value"}
+		tokenRows := make([][]any, 0, tokenTransfersCount)
+
+		for _, item := range txs {
+			for _, tokenMove := range item.TokenMoves {
+				tokenRows = append(tokenRows, []any{
+					tokenMove.TxHash, tokenMove.BlockNumber, tokenMove.ContractAddress,
+					tokenMove.FromAddress, tokenMove.ToAddress, tokenMove.Value,
+				})
+			}
 		}
 
-		for _, tokenMove := range item.TokenMoves {
-			_, err = txCtx.Exec(context.Background(), tokenQuery,
-				tokenMove.TxHash, tokenMove.BlockNumber, tokenMove.ContractAddress,
-				tokenMove.FromAddress, tokenMove.ToAddress, tokenMove.Value,
-			)
-			if err != nil {
-				return fmt.Errorf("failed to execute token transfer query: %w", err)
-			}
-
-			// Вот эта строчка покажет вам результат прямо в консоли при работе!
-			log.Printf("[ERC-20] Found token transfer: %s tokens from %s to %s", tokenMove.Value, tokenMove.FromAddress, tokenMove.ToAddress)
+		_, err = txCtx.CopyFrom(
+			context.Background(),
+			pgx.Identifier{"token_transfers"},
+			tokenColumns,
+			pgx.CopyFromRows(tokenRows),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to bulk copy token transfers: %w", err)
 		}
 	}
 

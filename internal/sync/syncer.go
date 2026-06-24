@@ -147,7 +147,11 @@ func (s *Syncer) Start(ctx context.Context) error {
 			}
 
 			// Trigger the real-time notification layer for parsed token transfers
-			s.notifier.CheckAndNotify(res.txs[i].TokenMoves)
+			for _, tx := range res.txs {
+				if len(tx.TokenMoves) > 0 {
+					s.notifier.CheckAndNotify(tx.TokenMoves)
+				}
+			}
 
 			log.Printf("Successfully indexed block #%d (%d transactions committed).", res.blockNumber, len(res.txs))
 		}
