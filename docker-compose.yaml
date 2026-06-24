@@ -5,20 +5,52 @@ services:
     image: postgres:16-alpine
     container_name: eth_indexer_db
     environment:
-      POSTGRES_USER: indexer_user
-      POSTGRES_PASSWORD: indexer_password
-      POSTGRES_DB: eth_indexer
+      # Inject credentials securely from the local .env file
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # Performance tuning for heavy write-heavy ETL processes
+    # shared_buffers: Allocates memory for caching data
+    # max_connections: Limits active connection overhead
+    # synchronous_commit=off: Disables instant disk flushing for WAL, boosting batch inserts 2-4x
     command: >
       postgres 
       -c shared_buffers=256MB 
       -c max_connections=50
       -c synchronous_commit=off
-    # synchronous_commit=off отключает немедленный сброс логов на диск ради скорости.
-    # Для учебного полигона и ETL-процессов это существенно ускорит Bulk Insert.
+    # Ensure Postgres is fully ready to accept connections before starting dependent services
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - indexer_network
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth_indexer_app
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Pass structural variables directly to config.go parser
+      - DATABASE_URL=${DATABASE_URL}
+      - ETH_RPC_URL=${ETH_RPC_URL}
+    networks:
+      - indexer_network
 
 volumes:
   pgdata:
+
+networks:
+  indexer_network:
+    driver: bridge
