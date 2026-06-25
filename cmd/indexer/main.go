@@ -29,7 +29,8 @@ func main() {
 		log.Fatalf("Database initialization failed: %v", err)
 	}
 
-	ethClient, err := blockchain.NewClient(cfg.EthRPCURL)
+	// Updated: passing cfg.RPS for the rate limiter
+	ethClient, err := blockchain.NewClient(cfg.EthRPCURL, cfg.RPS)
 	if err != nil {
 		log.Fatalf("Blockchain client initialization failed: %v", err)
 	}
@@ -48,7 +49,8 @@ func main() {
 		}
 	}()
 
-	syncer := sync.NewSyncer(db, ethClient)
+	// Updated: passing cfg.WorkerCount for the streaming worker pool
+	syncer := sync.NewSyncer(db, ethClient, cfg.WorkerCount)
 
 	log.Println("ETL Worker engine successfully armed. Entering infinite processing loop...")
 

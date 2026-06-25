@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
 	"github.com/joho/godotenv"
 )
@@ -12,6 +13,8 @@ import (
 type Config struct {
 	DatabaseURL string
 	EthRPCURL   string
+	RPS         int
+	WorkerCount int
 }
 
 // Load reads configuration from .env file and environment variables
@@ -34,8 +37,26 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ETH_RPC_URL environment variable is missing")
 	}
 
+	// Safe default: 15 requests per second if not specified
+	rps := 15
+	if rpsEnv := os.Getenv("ETH_RPS_LIMIT"); rpsEnv != "" {
+		if val, err := strconv.Atoi(rpsEnv); err == nil && val > 0 {
+			rps = val
+		}
+	}
+
+	// Safe default: 3 concurrent workers if not specified
+	workerCount := 3
+	if workerEnv := os.Getenv("SYNCER_WORKER_COUNT"); workerEnv != "" {
+		if val, err := strconv.Atoi(workerEnv); err == nil && val > 0 {
+			workerCount = val
+		}
+	}
+
 	return &Config{
 		DatabaseURL: dbURL,
 		EthRPCURL:   ethURL,
+		RPS:         rps,
+		WorkerCount: workerCount,
 	}, nil
 }

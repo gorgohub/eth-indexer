@@ -4,165 +4,143 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"time"
 
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
-	"github.com/gorgohub/eth-indexer/internal/notifier"
 	"github.com/gorgohub/eth-indexer/internal/storage"
 )
 
-// blockResult wraps fetched block metadata and its normalized transactions
-type blockResult struct {
-	blockNumber uint64
-	header      blockchain.BlockHeaderData
-	txs         []storage.Transaction
-	err         error
-}
-
-// Syncer orchestrates the ETL pipeline loop between Ethereum and PostgreSQL
-// Добавьте импорт "github.com/gorgohub/eth-indexer/internal/notifier" в блок import
 type Syncer struct {
-	db       *storage.DB
-	client   *blockchain.Client
-	notifier *notifier.Notifier // Added notifier dependency
+	client      *blockchain.Client
+	store       *storage.DB
+	workerCount int
 }
 
-// NewSyncer creates a new synchronizer instance
-func NewSyncer(db *storage.DB, client *blockchain.Client) *Syncer {
+// blockResult wraps data fetched by background workers to pass into the main recording thread
+type blockResult struct {
+	blockNum uint64
+	hash     string
+	pHash    string
+	time     uint64
+	err      error
+}
+
+func NewSyncer(store *storage.DB, client *blockchain.Client, workerCount int) *Syncer {
+	if workerCount <= 0 {
+		workerCount = 3 // Safe local machine default to avoid CPU overheating
+	}
 	return &Syncer{
-		db:       db,
-		client:   client,
-		notifier: notifier.NewNotifier(), // Initialize notifier service
+		client:      client,
+		store:       store,
+		workerCount: workerCount,
 	}
 }
 
-// Start launches a concurrent worker pool to fast-track block extraction and storage
+// Start initiates the long-running pipeline for streaming block sync
 func (s *Syncer) Start(ctx context.Context) error {
-	log.Println("Initializing concurrent synchronization loop...")
+	log.Println("Initializing concurrent synchronization loop with Worker Pool...")
 
-	startBlock, err := s.db.GetLatestSavedBlock()
+	// 1. Determine the exact block height to resume extraction from
+	lastSavedBlock, err := s.store.GetLatestSavedBlock()
 	if err != nil {
-		return fmt.Errorf("syncer startup failed: %w", err)
+		return fmt.Errorf("syncer startup failed: failed to fetch max block number: %w", err)
 	}
 
-	if startBlock == 0 {
-		startBlock = 25321800
-		log.Printf("Database is empty. Starting synchronization from baseline block #%d", startBlock)
+	var currentBlock uint64
+	if lastSavedBlock > 0 {
+		currentBlock = uint64(lastSavedBlock) + 1
 	} else {
-		log.Printf("Resuming synchronization from last saved block #%d", startBlock)
-		startBlock++
+		currentBlock = 1
 	}
 
-	networkHeight, err := s.client.GetLatestBlockNumber(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to fetch initial network height: %w", err)
+	// 2. Initialize bound pipeline channels
+	jobsChan := make(chan uint64, s.workerCount*2)
+	resultsChan := make(chan blockResult, s.workerCount*2)
+
+	// 3. Spawn long-lived worker goroutines
+	for w := 1; w <= s.workerCount; w++ {
+		go s.worker(ctx, jobsChan, resultsChan)
 	}
 
-	currentBlock := uint64(startBlock)
+	// 4. Run the dispatcher goroutine to stream block numbers into jobsChan
+	go func() {
+		defer close(jobsChan)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				latestBlock, err := s.client.BlockNumber(ctx)
+				if err != nil {
+					log.Printf("Error fetching latest block number: %v. Retrying in 2s...", err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
 
-	// Define bounds for our concurrent worker pool
-	workerCount := 5
-	jobsChan := make(chan uint64, workerCount)
-	resultsChan := make(chan blockResult, workerCount)
+				if currentBlock > latestBlock {
+					// Caught up with the chain tip, wait for a new block to be minted
+					time.Sleep(3 * time.Second)
+					continue
+				}
 
-	// 1. Spawn concurrent downloader workers
-	for w := 1; w <= workerCount; w++ {
-		go func(workerID int) {
-			for blockNum := range jobsChan {
-				// Each block download has its own independent strict network timeout
-				reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				txs, headerData, fetchErr := s.client.GetBlockTransactions(reqCtx, blockNum)
-				cancel()
-
-				resultsChan <- blockResult{
-					blockNumber: blockNum,
-					header:      headerData,
-					txs:         txs,
-					err:         fetchErr,
+				select {
+				case <-ctx.Done():
+					return
+				case jobsChan <- currentBlock:
+					currentBlock++
 				}
 			}
-		}(w)
-	}
+		}
+	}()
 
-	// Ensure channels close cleanly when we drop out of the control loop
-	defer close(jobsChan)
-
-	log.Printf("Spawned %d concurrent ETL execution workers.", workerCount)
-
-	// 2. Control pipeline orchestration loop
+	// 5. Main thread collects worker results and commits them into storage
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Synchronization worker received shutdown signal. Exiting loop.")
 			return ctx.Err()
-		default:
-		}
 
-		// Update network height dynamically if we are catching up close to the tip
-		if currentBlock > networkHeight {
-			networkHeight, err = s.client.GetLatestBlockNumber(ctx)
-			if err != nil {
-				log.Printf("Network error: failed to query latest block height: %v. Retrying in 5s...", err)
-				time.Sleep(5 * time.Second)
-				continue
+		case res, ok := <-resultsChan:
+			if !ok {
+				return nil
 			}
-
-			if currentBlock > networkHeight {
-				log.Printf("Fully synchronized with blockchain height #%d. Waiting for new blocks...", networkHeight)
-				time.Sleep(12 * time.Second)
-				continue
-			}
-		}
-
-		// Feed the jobs channel up to worker capacity
-		activeJobs := 0
-		for i := 0; i < workerCount && (currentBlock+uint64(i)) <= networkHeight; i++ {
-			jobsChan <- currentBlock + uint64(i)
-			activeJobs++
-		}
-
-		// Collect and strictly commit results sequentially to maintain historical order
-		hasErrors := false
-		for i := 0; i < activeJobs; i++ {
-			res := <-resultsChan
 			if res.err != nil {
-				log.Printf("ETL Error: worker failed to extract data for block %d: %v", res.blockNumber, res.err)
-				hasErrors = true
+				log.Printf("Worker reported error for block %d: %v", res.blockNum, res.err)
 				continue
 			}
 
-			// Commit to Database
-			err = s.db.SaveBlock(int64(res.blockNumber), res.header.Hash, res.header.ParentHash, res.header.Time)
+			// Save the block header metadata directly using the storage.DB instance
+			err := s.store.SaveBlock(int64(res.blockNum), res.hash, res.pHash, int64(res.time))
 			if err != nil {
-				log.Printf("Database Error: failed to write block header %d: %v", res.blockNumber, err)
-				hasErrors = true
+				log.Printf("Failed to commit block %d to database: %v", res.blockNum, err)
 				continue
 			}
+			log.Printf("Successfully synchronized block %d to storage", res.blockNum)
+		}
+	}
+}
 
-			err = s.db.SaveTransactions(res.txs)
+// worker listens to the job channel, processes the data, and pipes the outcome to resultsChan
+func (s *Syncer) worker(ctx context.Context, jobs <-chan uint64, results chan<- blockResult) {
+	for blockNum := range jobs {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			blockBig := new(big.Int).SetUint64(blockNum)
+			ethBlock, err := s.client.BlockByNumber(ctx, blockBig)
 			if err != nil {
-				log.Printf("Database Error: failed to commit transactions for block %d: %v", res.blockNumber, err)
-				hasErrors = true
+				results <- blockResult{blockNum: blockNum, err: err}
 				continue
 			}
 
-			// Trigger the real-time notification layer for parsed token transfers
-			for _, tx := range res.txs {
-				if len(tx.TokenMoves) > 0 {
-					s.notifier.CheckAndNotify(tx.TokenMoves)
-				}
+			results <- blockResult{
+				blockNum: blockNum,
+				hash:     ethBlock.Hash().Hex(),
+				pHash:    ethBlock.ParentHash().Hex(),
+				time:     ethBlock.Time(),
+				err:      nil,
 			}
-
-			log.Printf("Successfully indexed block #%d (%d transactions committed).", res.blockNumber, len(res.txs))
 		}
-
-		// If any error occurred during this batch, we do not increment currentBlock, forcing a safe retry
-		if hasErrors {
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		// Advance our pointer by the size of the successfully processed batch
-		currentBlock += uint64(activeJobs)
 	}
 }
