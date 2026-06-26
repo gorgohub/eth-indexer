@@ -3,7 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -39,7 +39,7 @@ func NewServer(db *storage.DB) *Server {
 
 // Start launches the HTTP listener on the given address
 func (s *Server) Start(addr string) error {
-	log.Printf("HTTP API Server listening on %s", addr)
+	slog.Info("HTTP API Server listening", slog.String("addr", addr))
 	return http.ListenAndServe(addr, s.router)
 }
 
@@ -67,7 +67,7 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 			s.respondWithError(w, http.StatusNotFound, "Block not found in local database")
 			return
 		}
-		log.Printf("API error: %v", err)
+		slog.Error("API error fetching block", slog.Int64("block_number", number), slog.Any("error", err))
 		s.respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
@@ -102,7 +102,7 @@ func (s *Server) handleGetTokenTransfers(w http.ResponseWriter, r *http.Request)
 // respondWithSlice helper processes query errors and forces empty json array instead of null
 func (s *Server) respondWithSlice(w http.ResponseWriter, data interface{}, queryErr error) {
 	if queryErr != nil {
-		log.Printf("API error: %v", queryErr)
+		slog.Error("API slice query error", slog.Any("error", queryErr))
 		s.respondWithError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
@@ -121,7 +121,7 @@ func (s *Server) respondWithJSON(w http.ResponseWriter, status int, payload inte
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("Failed to write JSON response: %v", err)
+		slog.Error("Failed to write JSON response", slog.Any("error", err))
 	}
 }
 

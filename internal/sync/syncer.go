@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"sync"
 	"time"
@@ -12,6 +12,23 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
 	"github.com/gorgohub/eth-indexer/internal/storage"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	blocksProcessed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "indexer_blocks_processed_total",
+		Help: "The total number of processed blocks (use rate() to get blocks per second)",
+	})
+	activeGoroutines = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_active_goroutines",
+		Help: "The number of active syncer worker goroutines",
+	})
+	chainLag = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "indexer_chain_lag",
+		Help: "The difference between network tip and current processed block",
+	})
 )
 
 type Syncer struct {
@@ -26,6 +43,7 @@ type blockResult struct {
 	hash     string
 	pHash    string
 	time     uint64
+	txCount  int
 	err      error
 }
 
@@ -42,7 +60,7 @@ func NewSyncer(store *storage.DB, client *blockchain.Client, workerCount int) *S
 
 // Start initiates the long-running pipeline for streaming block sync
 func (s *Syncer) Start(ctx context.Context) error {
-	log.Println("Initializing concurrent synchronization loop with Worker Pool...")
+	slog.Info("Initializing concurrent synchronization loop with Worker Pool...", slog.Int("worker_count", s.workerCount))
 
 	// 1. Determine the exact block height to resume extraction from
 	lastSavedBlock, err := s.store.GetLatestSavedBlock()
@@ -67,8 +85,10 @@ func (s *Syncer) Start(ctx context.Context) error {
 	// 3. Spawn long-lived worker goroutines
 	for w := 1; w <= s.workerCount; w++ {
 		wg.Add(1)
+		activeGoroutines.Inc()
 		go func() {
 			defer wg.Done()
+			defer activeGoroutines.Dec()
 			s.worker(ctx, jobsChan, resultsChan)
 		}()
 	}
@@ -87,9 +107,16 @@ func (s *Syncer) Start(ctx context.Context) error {
 					if ctx.Err() != nil {
 						return
 					}
-					log.Printf("Critical timeout reaching blockchain tip node: %v", err)
+					slog.Error("Critical timeout reaching blockchain tip node", slog.Any("error", err))
 					time.Sleep(2 * time.Second)
 					continue
+				}
+
+				// Update network topology lag metric
+				if latestBlock >= currentBlock {
+					chainLag.Set(float64(latestBlock - currentBlock))
+				} else {
+					chainLag.Set(0)
 				}
 
 				if currentBlock > latestBlock {
@@ -121,17 +148,22 @@ func (s *Syncer) Start(ctx context.Context) error {
 	// 5. Main thread collects worker results and commits them into storage
 	for res := range resultsChan {
 		if res.err != nil {
-			log.Printf("Worker reported unrecoverable error for block %d: %v", res.blockNum, res.err)
+			slog.Error("Worker reported unrecoverable error for block", slog.Uint64("block_num", res.blockNum), slog.Any("error", res.err))
 			continue
 		}
 
 		// Save the block header metadata directly using the storage.DB instance
 		err := s.store.SaveBlock(int64(res.blockNum), res.hash, res.pHash, int64(res.time))
 		if err != nil {
-			log.Printf("Failed to commit block %d to database: %v", res.blockNum, err)
+			slog.Error("Failed to commit block to database", slog.Uint64("block_num", res.blockNum), slog.Any("error", err))
 			continue
 		}
-		log.Printf("Successfully synchronized block %d to storage", res.blockNum)
+
+		blocksProcessed.Inc()
+		slog.Info("Successfully synchronized block to storage",
+			slog.Uint64("number", res.blockNum),
+			slog.Int("tx_count", res.txCount),
+		)
 	}
 
 	// Explicitly return context error if shutdown was triggered during execution loop
@@ -159,6 +191,7 @@ func (s *Syncer) worker(ctx context.Context, jobs <-chan uint64, results chan<- 
 			hash:     ethBlock.Hash().Hex(),
 			pHash:    ethBlock.ParentHash().Hex(),
 			time:     ethBlock.Time(),
+			txCount:  len(ethBlock.Transactions()),
 			err:      nil,
 		}
 	}
@@ -177,7 +210,7 @@ func (s *Syncer) fetchBlockNumberWithRetry(ctx context.Context) (uint64, error) 
 			return 0, ctx.Err()
 		}
 
-		log.Printf("RPC error getting tip block number: %v. Retrying in %v...", err, delay)
+		slog.Warn("RPC error getting tip block number. Retrying...", slog.Any("error", err), slog.Duration("retry_delay", delay))
 
 		select {
 		case <-ctx.Done():
@@ -215,7 +248,11 @@ func (s *Syncer) fetchBlockWithRetry(ctx context.Context, number *big.Int) (*typ
 			return nil, fmt.Errorf("shutdown requested, abandoning block %s: %w", number.String(), err)
 		}
 
-		log.Printf("RPC error retrieving block metrics for %s: %v. Retrying in %v...", number.String(), err, delay)
+		slog.Warn("RPC error retrieving block metrics. Retrying...",
+			slog.String("block_number", number.String()),
+			slog.Any("error", err),
+			slog.Duration("retry_delay", delay),
+		)
 
 		select {
 		case <-maxRetryTime:

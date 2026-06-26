@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,30 +14,47 @@ import (
 	"github.com/gorgohub/eth-indexer/internal/config"
 	"github.com/gorgohub/eth-indexer/internal/storage"
 	"github.com/gorgohub/eth-indexer/internal/sync"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
-	log.Println("Starting Web3 Indexer service...")
+	// Initialize structured JSON logging globally
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	slog.Info("Starting Web3 Indexer service...")
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Config initialization failed: %v", err)
+		slog.Error("Config initialization failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	db, err := storage.NewConnect(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("Database initialization failed: %v", err)
+		slog.Error("Database initialization failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	// Updated: passing cfg.RPS for the rate limiter
 	ethClient, err := blockchain.NewClient(cfg.EthRPCURL, cfg.RPS)
 	if err != nil {
-		log.Fatalf("Blockchain client initialization failed: %v", err)
+		slog.Error("Blockchain client initialization failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	// Setup graceful shutdown handling for SIGINT (Ctrl+C) and SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start Prometheus metrics server on a dedicated port
+	go func() {
+		slog.Info("Prometheus metrics server listening on :2112")
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(":2112", nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Critical metrics HTTP server failure", slog.Any("error", err))
+		}
+	}()
 
 	// Initialize the HTTP API server
 	apiServer := api.NewServer(db)
@@ -45,30 +62,31 @@ func main() {
 	// Launch the HTTP server asynchronously in a goroutine to prevent blocking the main execution flow
 	go func() {
 		if err := apiServer.Start(":8080"); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("Critical API HTTP server failure: %v", err)
+			slog.Error("Critical API HTTP server failure", slog.Any("error", err))
+			os.Exit(1)
 		}
 	}()
 
 	// Updated: passing cfg.WorkerCount for the streaming worker pool
 	syncer := sync.NewSyncer(db, ethClient, cfg.WorkerCount)
 
-	log.Println("ETL Worker engine successfully armed. Entering infinite processing loop...")
+	slog.Info("ETL Worker engine successfully armed. Entering infinite processing loop...")
 
 	if err := syncer.Start(ctx); err != nil {
 		if errors.Is(err, context.Canceled) {
-			log.Println("Indexer service stopped cleanly via graceful shutdown.")
+			slog.Info("Indexer service stopped cleanly via graceful shutdown.")
 		} else {
-			log.Printf("Critical sync loop failure: %v", err)
+			slog.Error("Critical sync loop failure", slog.Any("error", err))
 		}
 	}
 
 	// Gracefully release active network resources and connection pools after loop termination
-	log.Println("Closing underlying network connections and DB pools...")
+	slog.Info("Closing underlying network connections and DB pools...")
 	ethClient.Close()
 
 	if err := db.Close(); err != nil {
-		log.Printf("Failed to cleanly close database connection pool: %v", err)
+		slog.Error("Failed to cleanly close database connection pool", slog.Any("error", err))
 	}
 
-	log.Println("Shutdown complete. Bye!")
+	slog.Info("Shutdown complete. Bye!")
 }

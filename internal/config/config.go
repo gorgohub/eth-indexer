@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -24,7 +24,7 @@ func Load() (*Config, error) {
 	// so we don't fail if the .env file itself is missing.
 	if err := godotenv.Load(); err != nil {
 		// We do not return an error here, just proceed to check system env vars
-		log.Printf("Notice: .env file not found, relying on system environment variables")
+		slog.Info("Notice: .env file not found, relying on system environment variables")
 	}
 
 	dbURL := os.Getenv("DATABASE_URL")

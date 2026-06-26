@@ -1,7 +1,7 @@
 package notifier
 
 import (
-	"log"
+	"log/slog"
 	"math/big"
 
 	"github.com/gorgohub/eth-indexer/internal/storage"
@@ -41,9 +41,12 @@ func (n *Notifier) CheckAndNotify(transfers []storage.TokenTransfer) {
 
 // sendAlert simulates dispatching a structured alert to external systems (e.g., Telegram, Webhooks)
 func (n *Notifier) sendAlert(t storage.TokenTransfer) {
-	log.Printf("[WHALE ALERT] 🚨 Large token move detected on block %d!", t.BlockNumber)
-	log.Printf("[WHALE ALERT] Tx: %s", t.TxHash)
-	log.Printf("[WHALE ALERT] Contract: %s", t.ContractAddress)
-	log.Printf("[WHALE ALERT] From: %s -> To: %s", t.FromAddress, t.ToAddress)
-	log.Printf("[WHALE ALERT] Raw Value: %s units", t.Value)
+	slog.Warn("[WHALE ALERT] Large token move detected!",
+		slog.Int64("block_number", t.BlockNumber),
+		slog.String("tx_hash", t.TxHash),
+		slog.String("contract_address", t.ContractAddress),
+		slog.String("from", t.FromAddress),
+		slog.String("to", t.ToAddress),
+		slog.String("raw_value", t.Value),
+	)
 }
