@@ -2,11 +2,14 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
+	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/gorgohub/eth-indexer/internal/blockchain"
 	"github.com/gorgohub/eth-indexer/internal/storage"
 )
@@ -58,9 +61,16 @@ func (s *Syncer) Start(ctx context.Context) error {
 	jobsChan := make(chan uint64, s.workerCount*2)
 	resultsChan := make(chan blockResult, s.workerCount*2)
 
+	// Use WaitGroup to synchronize clean termination of background worker routines
+	var wg sync.WaitGroup
+
 	// 3. Spawn long-lived worker goroutines
 	for w := 1; w <= s.workerCount; w++ {
-		go s.worker(ctx, jobsChan, resultsChan)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.worker(ctx, jobsChan, resultsChan)
+		}()
 	}
 
 	// 4. Run the dispatcher goroutine to stream block numbers into jobsChan
@@ -71,17 +81,25 @@ func (s *Syncer) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			default:
-				latestBlock, err := s.client.BlockNumber(ctx)
+				// Fetch current tip using exponential backoff to handle network fragility safely
+				latestBlock, err := s.fetchBlockNumberWithRetry(ctx)
 				if err != nil {
-					log.Printf("Error fetching latest block number: %v. Retrying in 2s...", err)
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("Critical timeout reaching blockchain tip node: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
 
 				if currentBlock > latestBlock {
 					// Caught up with the chain tip, wait for a new block to be minted
-					time.Sleep(3 * time.Second)
-					continue
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(3 * time.Second):
+						continue
+					}
 				}
 
 				select {
@@ -94,53 +112,120 @@ func (s *Syncer) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Close resultsChan only after all workers completely finish pulling from jobsChan
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
 	// 5. Main thread collects worker results and commits them into storage
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case res, ok := <-resultsChan:
-			if !ok {
-				return nil
-			}
-			if res.err != nil {
-				log.Printf("Worker reported error for block %d: %v", res.blockNum, res.err)
-				continue
-			}
-
-			// Save the block header metadata directly using the storage.DB instance
-			err := s.store.SaveBlock(int64(res.blockNum), res.hash, res.pHash, int64(res.time))
-			if err != nil {
-				log.Printf("Failed to commit block %d to database: %v", res.blockNum, err)
-				continue
-			}
-			log.Printf("Successfully synchronized block %d to storage", res.blockNum)
+	for res := range resultsChan {
+		if res.err != nil {
+			log.Printf("Worker reported unrecoverable error for block %d: %v", res.blockNum, res.err)
+			continue
 		}
+
+		// Save the block header metadata directly using the storage.DB instance
+		err := s.store.SaveBlock(int64(res.blockNum), res.hash, res.pHash, int64(res.time))
+		if err != nil {
+			log.Printf("Failed to commit block %d to database: %v", res.blockNum, err)
+			continue
+		}
+		log.Printf("Successfully synchronized block %d to storage", res.blockNum)
 	}
+
+	// Explicitly return context error if shutdown was triggered during execution loop
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	return nil
 }
 
 // worker listens to the job channel, processes the data, and pipes the outcome to resultsChan
 func (s *Syncer) worker(ctx context.Context, jobs <-chan uint64, results chan<- blockResult) {
 	for blockNum := range jobs {
+		blockBig := new(big.Int).SetUint64(blockNum)
+
+		// Pass the legitimate application context downwards
+		ethBlock, err := s.fetchBlockWithRetry(ctx, blockBig)
+		if err != nil {
+			results <- blockResult{blockNum: blockNum, err: err}
+			continue
+		}
+
+		results <- blockResult{
+			blockNum: blockNum,
+			hash:     ethBlock.Hash().Hex(),
+			pHash:    ethBlock.ParentHash().Hex(),
+			time:     ethBlock.Time(),
+			err:      nil,
+		}
+	}
+}
+
+// fetchBlockNumberWithRetry polls blockchain tip height using progressive backoff mechanics
+func (s *Syncer) fetchBlockNumberWithRetry(ctx context.Context) (uint64, error) {
+	delay := 1 * time.Second
+	for {
+		latestBlock, err := s.client.BlockNumber(ctx)
+		if err == nil {
+			return latestBlock, nil
+		}
+
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return 0, ctx.Err()
+		}
+
+		log.Printf("RPC error getting tip block number: %v. Retrying in %v...", err, delay)
+
 		select {
 		case <-ctx.Done():
-			return
-		default:
-			blockBig := new(big.Int).SetUint64(blockNum)
-			ethBlock, err := s.client.BlockByNumber(ctx, blockBig)
-			if err != nil {
-				results <- blockResult{blockNum: blockNum, err: err}
-				continue
-			}
+			return 0, ctx.Err()
+		case <-time.After(delay):
+		}
 
-			results <- blockResult{
-				blockNum: blockNum,
-				hash:     ethBlock.Hash().Hex(),
-				pHash:    ethBlock.ParentHash().Hex(),
-				time:     ethBlock.Time(),
-				err:      nil,
-			}
+		delay *= 2
+	}
+}
+
+// fetchBlockWithRetry handles block data collection safely protecting internal pipelines from crashing
+func (s *Syncer) fetchBlockWithRetry(ctx context.Context, number *big.Int) (*types.Block, error) {
+	delay := 1 * time.Second
+	maxRetryTime := time.After(30 * time.Second)
+
+	for {
+		// If the main context was canceled (Ctrl+C), we switch to a background context
+		// with a strict timeout to let this specific block finish saving without data loss.
+		activeCtx := ctx
+		if errors.Is(ctx.Err(), context.Canceled) {
+			activeCtx = context.Background()
+		}
+
+		reqCtx, cancel := context.WithTimeout(activeCtx, 5*time.Second)
+		ethBlock, err := s.client.BlockByNumber(reqCtx, number)
+		cancel()
+
+		if err == nil {
+			return ethBlock, nil
+		}
+
+		// If it failed because the application is shutting down, and we exceeded limits, abort
+		if errors.Is(ctx.Err(), context.Canceled) && delay > 4*time.Second {
+			return nil, fmt.Errorf("shutdown requested, abandoning block %s: %w", number.String(), err)
+		}
+
+		log.Printf("RPC error retrieving block metrics for %s: %v. Retrying in %v...", number.String(), err, delay)
+
+		select {
+		case <-maxRetryTime:
+			return nil, fmt.Errorf("failed to fetch block %s after 30s timeout: %w", number.String(), err)
+		case <-time.After(delay):
+		}
+
+		delay *= 2
+		if delay > 8*time.Second {
+			delay = 8 * time.Second // Cap max delay
 		}
 	}
 }
